@@ -1,76 +1,69 @@
 package org.example;
 
+import com.rabbitmq.client.*;
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.Connection;
+import com.rabbitmq.client.ConnectionFactory;
+import org.json.JSONObject;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
 
-
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.*;
+import java.util.concurrent.TimeoutException;
 
-public class Crawler {
-    BlockingQueue<Article> resultArticles;
-    String url;
-    Document doc;
+public class ArticleReader implements Runnable {
 
-    Crawler(String url) {
-        this.url = url;
-        this.resultArticles = new LinkedBlockingQueue<>();
+    private final ConnectionFactory factory;
+    private final String linkQueue;
+    private final String resultQueue;
+    private Channel channel;
+
+    public ArticleReader(ConnectionFactory factory, String linkQueue, String resultQueue) {
+        this.factory = factory;
+        this.linkQueue = linkQueue;
+        this.resultQueue = resultQueue;
+    }
+
+    @Override
+    public void run() {
         try {
-            this.doc = Jsoup.connect(this.url).userAgent("Mozilla").cookie("beget", "begetok").get();
-        } catch (IOException e) {
-            throw new RuntimeException("Could not connect to url: " + this.url);
-        }
-    }
+            Connection connection = factory.newConnection();
+            this.channel = connection.createChannel();
 
-    public BlockingQueue<Article> getArticles() {
-        return resultArticles;
-    }
+            try {
+                channel.queueDeclare(linkQueue, false, false, false, null);
 
-    public void execute() throws InterruptedException {
-        collectAllInfo();
-    }
+                GetResponse response = channel.basicGet(linkQueue, false);
+                while (response != null) {
+                    String responseBody = new String(response.getBody(), StandardCharsets.UTF_8);
+                    JSONObject jsonResponse = new JSONObject(responseBody);
+                    String link = jsonResponse.getString("link");
+                    Article article = collectArticleInfo(link);
 
-    private void collectAllInfo() {
-        ExecutorService threadExecutor = Executors.newFixedThreadPool(3);
+                    channel.basicPublish("", resultQueue, null, article.toString().getBytes(StandardCharsets.UTF_8));
+                    channel.basicAck(response.getEnvelope().getDeliveryTag(), false);
+                    response = channel.basicGet(linkQueue, false);
 
-        Elements articleElements = doc.getElementsByClass("card-mini__title");
-        Elements bigArticleElements = doc.getElementsByClass("card-big__title");
-        articleElements.addAll(bigArticleElements);
-        if (articleElements.isEmpty())
-            throw new RuntimeException("No results for link: " + url);
-
-        BlockingQueue<Element> linkQueue = new LinkedBlockingQueue<>(articleElements);
-
-        while (!linkQueue.isEmpty()) {
-            Element articleElement = linkQueue.poll();
-            threadExecutor.execute(() -> {
-                String link = getArticleLink(articleElement);
-                Article article = collectArticleInfo(link);
-                if (article != null) {
-                    this.resultArticles.add(article);
+                    System.out.println(article.toString());
                 }
-            });
-        }
 
-        threadExecutor.shutdown();
-        try {
-            threadExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
-        } catch (InterruptedException e) {
-            throw new RuntimeException("Error while waiting threads: " + e);
+            } catch (IOException e) {
+                System.err.println("Error when reading link: " + e);
+            } finally {
+                channel.close();
+                connection.close();
+            }
+        } catch (IOException | TimeoutException e) {
+            throw new RuntimeException("Error in RabbitMQ connection/channel: " + e);
         }
-    }
-
-    public void writeArticle() {
-        resultArticles.forEach(article -> System.out.println(article.toString()));
     }
 
     private Article collectArticleInfo(String link) {
         Article article = new Article();
-
         article.setLink(link);
 
         Document articleDetails;
@@ -96,25 +89,6 @@ public class Crawler {
         article.createHash();
 
         return article;
-    }
-
-    private String getArticleLink(Element articleElement) {
-        if (articleElement.parent() == null || articleElement.parent().parent() == null) {
-            return null;
-        }
-
-        String href;
-        String sub_href = articleElement.parent().parent().attr("href");
-        if (sub_href.isEmpty())
-            return null;
-
-        if (sub_href.startsWith("http")) {
-            href = sub_href;
-        } else {
-            href = url + sub_href;
-        }
-
-        return href;
     }
 
     private String collectArticleTitleInfo(Document articleDetails, String href) {

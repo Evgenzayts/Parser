@@ -3,6 +3,9 @@ target/
 !**/src/main/**/target/
 !**/src/test/**/target/
 
+docker-compose/docker-data/*
+docker-compose/docker-elk/*
+
 ### IntelliJ IDEA ###
 .idea/*
 *.iws
